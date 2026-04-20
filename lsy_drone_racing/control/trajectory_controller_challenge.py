@@ -56,7 +56,7 @@ class TrajectoryController(Controller):
                 [0.5, -0.65, 1.1],
             ]
         )
-        self.t_total = 25
+        self.t_total = 24
         t = np.linspace(0, self.t_total, len(waypoints))
         self.trajectory = CubicSpline(
             t, waypoints, bc_type=((1, [0.0, 0.0, 0.5]), (2, [0.0, 0.0, 0.0]))
