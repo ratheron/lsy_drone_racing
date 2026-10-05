@@ -15,12 +15,14 @@ import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
+from crazyflow.sim.visualize import draw_line, draw_points
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 
 if TYPE_CHECKING:
+    from crazyflow import Sim
     from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
@@ -51,12 +53,15 @@ class TrajectoryController(Controller):
                 [0.85, 0.85, 1.1],
                 [-0.5, -0.05, 0.65],
                 [-1.3, -0.1, 0.52],
-                [-1.3, -0.1, 1.1],
-                [-0.0, -0.65, 1.1],
-                [0.5, -0.65, 1.1],
+                [-1.3, -0.1, 1.15],
+                [-0.0, -0.75, 1.2],
+                [1.0, -0.4, 1.2],
+                [1.3, 0.35, 1.2],
+                [0.8, 0.9, 1.2],
             ]
         )
-        self.t_total = 22
+        self.waypoints = waypoints
+        self.t_total = 28
         t = np.linspace(0, self.t_total, len(waypoints))
         self.trajectory = CubicSpline(
             t, waypoints, bc_type=((1, [0.0, 0.0, 0.5]), (2, [0.0, 0.0, 0.0]))
@@ -78,8 +83,8 @@ class TrajectoryController(Controller):
             info: Optional additional information as a dictionary.
 
         Returns:
-            The drone state [x, y, z, vx, vy, vz, ax, ay, az, yaw, rrate, prate, yrate] as a numpy
-                array.
+            The drone state [x, y, z, vx, vy, vz, ax, ay, az, qx, qy, qz, qw, wx, wy, wz] as a
+            numpy array.
         """
         i = min(self._tick / self._freq, self.t_total)
         if i >= self.t_total:  # Maximum duration reached
@@ -200,7 +205,8 @@ class TrajectoryController(Controller):
 
         logger.debug(f"{gate_pos=}, {gate_edge1=}, {gate_edge2=}")
 
-        return np.concatenate((target_pos, np.zeros(10)), dtype=np.float32)
+        des_quat = R.from_euler("z", 0.0).as_quat()
+        return np.concatenate((target_pos, np.zeros(6), des_quat, np.zeros(3)), dtype=np.float32)
 
     def step_callback(
         self,
@@ -218,3 +224,15 @@ class TrajectoryController(Controller):
         """
         self._tick += 1
         return self._finished
+
+    def render_callback(self, sim: Sim):
+        """Callback function called before the environment's rendering.
+
+        You can use this function to render additional information on the screen, such as the
+        planned trajectory, the drone's target state, etc.
+        """
+        # setpoint = self._des_pos_spline(self._tick / self._freq).reshape(1, -1)
+        # draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.02)
+        draw_points(sim, self.waypoints, rgba=(1.0, 0.0, 0.0, 1.0), size=0.02)
+        trajectory = self.trajectory(np.linspace(0, self.t_total, 100))
+        draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
