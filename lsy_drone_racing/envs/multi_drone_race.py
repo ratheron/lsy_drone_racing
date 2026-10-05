@@ -44,7 +44,6 @@ class MultiDroneRaceEnv(RaceCoreEnv, Env):
         """Initialize the multi-agent drone racing environment.
 
         Args:
-            n_drones: Number of drones.
             freq: Environment step frequency.
             sim_config: Simulation configuration.
             track: Track configuration.
@@ -72,10 +71,11 @@ class MultiDroneRaceEnv(RaceCoreEnv, Env):
             device=device,
         )
         self.action_space = batch_space(
-            build_action_space(control_mode, sim_config.drone_model), n_drones
+            build_action_space(control_mode, sim_config.drone, sim_config.dynamics), n_drones
         )
         self.observation_space = batch_space(
-            build_observation_space(n_gates, n_obstacles), n_drones
+            build_observation_space(n_gates, n_obstacles, self.data.gate_sequence.shape[0]),
+            n_drones,
         )
         self.settings = self.settings.replace(autoreset=False)
         self._step = self.build_step_fn()  # Apply new settings to capture autoreset effect
@@ -167,11 +167,12 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
         )
         self.num_envs = num_envs
         self.single_action_space = batch_space(
-            build_action_space(control_mode, sim_config.drone_model), n_drones
+            build_action_space(control_mode, sim_config.drone, sim_config.dynamics), n_drones
         )
         self.action_space = batch_space(batch_space(self.single_action_space), num_envs)
         self.single_observation_space = batch_space(
-            build_observation_space(n_gates, n_obstacles), n_drones
+            build_observation_space(n_gates, n_obstacles, self.data.gate_sequence.shape[0]),
+            n_drones,
         )
         self.observation_space = batch_space(self.single_observation_space, num_envs)
 

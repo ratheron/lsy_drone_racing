@@ -4,7 +4,7 @@ import gymnasium
 import jax
 import jax.numpy as jp
 import pytest
-from drone_models import available_models
+from crazyflow.dynamics import Dynamics
 
 import lsy_drone_racing  # noqa: F401, environment registrations
 from lsy_drone_racing.envs.drone_race import DroneRaceEnv
@@ -36,15 +36,15 @@ def skip_unavailable_device(device: str):
         pytest.skip(f"{device} device not available")
 
 
-@pytest.mark.parametrize("physics", available_models.keys())
+@pytest.mark.parametrize("dynamics", Dynamics)
 @pytest.mark.parametrize("config_file", CONFIG_FILES["DroneRacing-v0"])
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.integration
-def test_single_drone_envs(config_file: str, physics: str, device: str):
-    """Test the simulation environments with different physics modes and config files."""
+def test_single_drone_envs(config_file: str, dynamics: Dynamics, device: str):
+    """Test the simulation environments with different dynamics modes and config files."""
     config = load_config(Path(__file__).parents[2] / "config" / config_file)
-    assert hasattr(config.sim, "physics"), "Physics mode is not set"
-    config.sim.physics = physics  # override physics mode
+    assert hasattr(config.sim, "dynamics"), "dynamics mode is not set"
+    config.sim.dynamics = dynamics.value  # override dynamics mode
     assert hasattr(config.env, "id"), "Environment ID is not set"
     skip_unavailable_device(device)
 
@@ -78,15 +78,15 @@ def test_single_drone_envs(config_file: str, physics: str, device: str):
     env.close()
 
 
-@pytest.mark.parametrize("physics", available_models.keys())
+@pytest.mark.parametrize("dynamics", Dynamics)
 @pytest.mark.parametrize("config_file", CONFIG_FILES["MultiDroneRacing-v0"])
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.integration
-def test_multi_drone_envs(config_file: str, physics: str, device: str):
-    """Test the simulation environments with different physics modes and config files."""
+def test_multi_drone_envs(config_file: str, dynamics: Dynamics, device: str):
+    """Test the simulation environments with different dynamics modes and config files."""
     config = load_config(Path(__file__).parents[2] / "config" / config_file)
-    assert hasattr(config.sim, "physics"), "Physics mode is not set"
-    config.sim.physics = physics
+    assert hasattr(config.sim, "dynamics"), "dynamics mode is not set"
+    config.sim.dynamics = dynamics.value
     assert hasattr(config.env, "id"), "Environment ID is not set"
     skip_unavailable_device(device)
 
@@ -211,7 +211,9 @@ def test_render():
 
     # Force terminal state
     data = env.unwrapped.data
-    env.unwrapped.data = data.replace(target_gate=data.target_gate.at[...].set(-1))
+    env.unwrapped.data = data.replace(
+        n_gates_passed=data.n_gates_passed.at[...].set(data.gate_sequence.shape[0])
+    )
     env.step(env.action_space.sample())
     assert jp.all(env.unwrapped.data.disabled_drones), "drone not actually disabled"
     env.render()
@@ -242,29 +244,33 @@ def test_render_multi_drone():
         env.step(env.action_space.sample())
         env.render()
 
-    # Force only drone 0 (in world 0) into a terminal state by setting its target
-    # gate to -1. The other drones stay active, so autoreset will not fire (it
+    # Force only drone 0 (in world 0) into a terminal state by setting its gate-pass count to the
+    # sequence length. The other drones stay active, so autoreset will not fire (it
     # only triggers when all drones in a world are disabled). The next step will
     # mark drone 0 as disabled and warp it below the ground via
     # `_warp_disabled_drones`, exercising the renderer with a mix of active and
     # warped drones.
     data = env.unwrapped.data
-    env.unwrapped.data = data.replace(target_gate=data.target_gate.at[0, 0].set(-1))
+    env.unwrapped.data = data.replace(
+        n_gates_passed=data.n_gates_passed.at[0, 0].set(data.gate_sequence.shape[0])
+    )
     env.step(env.action_space.sample())
 
     # Verify drone 0 is disabled and the others are still active.
     disabled = env.unwrapped.data.disabled_drones
-    assert bool(disabled[0, 0]), "drone 0 should be disabled after target_gate=-1"
+    assert bool(disabled[0, 0]), "drone 0 should be disabled after finishing the gate sequence"
     assert not bool(jp.all(disabled)), "only drone 0 should be disabled, not all drones"
 
     env.render()
 
-    # Force ALL drones into a terminal state by setting every target gate to
-    # -1. On the next step, every drone will be disabled and (because the env
+    # Force ALL drones into a terminal state by setting every gate-pass count to the sequence
+    # length. On the next step, every drone will be disabled and (because the env
     # has autoreset enabled) the world will be auto-reset before render is
     # called again.
     data = env.unwrapped.data
-    env.unwrapped.data = data.replace(target_gate=data.target_gate.at[...].set(-1))
+    env.unwrapped.data = data.replace(
+        n_gates_passed=data.n_gates_passed.at[...].set(data.gate_sequence.shape[0])
+    )
     env.step(env.action_space.sample())
     env.render()
     env.close()

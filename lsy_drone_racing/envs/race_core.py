@@ -13,9 +13,9 @@ The environment is designed to be configurable, supporting:
 * Vectorized execution for parallel training
 
 This module is primarily used as a base for the higher-level environments in
-:mod:`~lsy_drone_racing.envs.drone_race` and :mod:`~lsy_drone_racing.envs.multi_drone_race`,
-which provide Gymnasium-compatible interfaces for reinforcement learning, MPC and other control
-techniques.
+[drone_race][lsy_drone_racing.envs.drone_race] and
+[multi_drone_race][lsy_drone_racing.envs.multi_drone_race], which provide Gymnasium-compatible
+interfaces for reinforcement learning, MPC and other control techniques.
 """
 
 from __future__ import annotations
@@ -31,10 +31,11 @@ import jax
 import jax.numpy as jp
 import mujoco
 import numpy as np
+from crazyflow.dynamics import load_params as load_dynamics_params
 from crazyflow.sim import Sim
+from crazyflow.sim.pipeline import append_fn, insert_fn_before
 from crazyflow.sim.sim import seed_sim, sync_sim2mjx, use_box_collision
 from crazyflow.utils import leaf_replace
-from drone_controllers.mellinger.params import ForceTorqueParams
 from flax.struct import dataclass
 from gymnasium import spaces
 from scipy.spatial.transform import Rotation as R
@@ -49,9 +50,11 @@ from lsy_drone_racing.envs.randomize import (
     randomize_gate_rpy_fn,
     randomize_obstacle_pos_fn,
 )
-from lsy_drone_racing.envs.utils import gate_passed, load_track
+from lsy_drone_racing.envs.utils import gate_passed, load_gate_order, load_track
 
 if TYPE_CHECKING:
+    from crazyflow.drones import Drone
+    from crazyflow.dynamics import Dynamics
     from crazyflow.sim.data import SimData
     from jax import Array, Device
     from ml_collections import ConfigDict
@@ -69,12 +72,13 @@ class EnvData:
     """Struct holding the data of all auxiliary variables for the environment.
 
     This dataclass stores the dynamic and static state of the environment that is not directly
-    part of the physics simulation. It includes information about gate progress, drone status,
-    and environment boundaries. Static variables are initialized once and do not change during the
+    part of the drone simulation. It includes information about gate progress, drone status, and
+    environment boundaries. Static variables are initialized once and do not change during the
     episode.
 
-    Args:
-        target_gate: Current target gate index for each drone in each environment
+    Attributes:
+        n_gates_passed: Number of configured gate-order entries already passed by each drone in
+            each environment
         gates_visited: Boolean flags indicating which gates have been visited by each drone
         obstacles_visited: Boolean flags indicating which obstacles have been detected
         last_drone_pos: Previous positions of drones, used for gate passing detection
@@ -87,10 +91,13 @@ class EnvData:
         obstacle_mj_ids: MuJoCo IDs for the obstacles
         max_episode_steps: Maximum number of steps per episode
         sensor_range: Range at which drones can detect gates and obstacles
+        gate_sequence: 0-based gate IDs describing the configured gate order
+        gate_sequence_direction: Signed passing directions for each gate-order entry. ``1``
+            indicates the positive passing direction, ``-1`` the reverse direction.
     """
 
     # Dynamic variables
-    target_gate: Array
+    n_gates_passed: Array
     gates_visited: Array
     obstacles_visited: Array
     last_drone_pos: Array
@@ -107,6 +114,8 @@ class EnvData:
     nominal_gates_pos: Array
     nominal_gates_quat: Array
     nominal_obstacles_pos: Array
+    gate_sequence: Array
+    gate_sequence_direction: Array
     # sim_data is stored in the env data to allow passing a single tree on which we can operate
     sim_data: SimData
     # Static variables
@@ -128,19 +137,25 @@ class EnvData:
         nominal_gates_pos: Array,
         nominal_gates_quat: Array,
         nominal_obstacles_pos: Array,
+        gate_sequence: Array,
+        gate_sequence_direction: Array,
         sim_data: SimData,
         device: Device,
     ) -> EnvData:
         """Create a new environment data struct with default values."""
         n_envs = sim_data.core.n_worlds
         n_drones = sim_data.core.n_drones
-        gates_pos = jax.device_put(jp.tile(nominal_gates_pos[None, ...], (n_envs, 1, 1)), device)
-        gates_quat = jax.device_put(jp.tile(nominal_gates_quat[None, ...], (n_envs, 1, 1)), device)
-        obstacles_pos = jax.device_put(
+        tiled_gates_pos = jax.device_put(
+            jp.tile(nominal_gates_pos[None, ...], (n_envs, 1, 1)), device
+        )
+        tiled_gates_quat = jax.device_put(
+            jp.tile(nominal_gates_quat[None, ...], (n_envs, 1, 1)), device
+        )
+        tiled_obstacles_pos = jax.device_put(
             jp.tile(nominal_obstacles_pos[None, ...], (n_envs, 1, 1)), device
         )
         return EnvData(
-            target_gate=jp.zeros((n_envs, n_drones), dtype=int, device=device),
+            n_gates_passed=jp.zeros((n_envs, n_drones), dtype=int, device=device),
             gates_visited=jp.zeros((n_envs, n_drones, n_gates), dtype=bool, device=device),
             obstacles_visited=jp.zeros((n_envs, n_drones, n_obstacles), dtype=bool, device=device),
             last_drone_pos=jp.zeros((n_envs, n_drones, 3), dtype=np.float32, device=device),
@@ -152,12 +167,14 @@ class EnvData:
             pos_limit_low=jp.array(pos_limit_low, dtype=np.float32, device=device),
             pos_limit_high=jp.array(pos_limit_high, dtype=np.float32, device=device),
             max_episode_steps=jp.array([max_episode_steps], dtype=int, device=device),
-            gates_pos=gates_pos,
-            gates_quat=gates_quat,
-            obstacles_pos=obstacles_pos,
-            nominal_gates_pos=jp.array(nominal_gates_pos, dtype=np.float32, device=device),
-            nominal_gates_quat=jp.array(nominal_gates_quat, dtype=np.float32, device=device),
-            nominal_obstacles_pos=jp.array(nominal_obstacles_pos, dtype=np.float32, device=device),
+            gates_pos=tiled_gates_pos,
+            gates_quat=tiled_gates_quat,
+            obstacles_pos=tiled_obstacles_pos,
+            nominal_gates_pos=tiled_gates_pos,
+            nominal_gates_quat=tiled_gates_quat,
+            nominal_obstacles_pos=tiled_obstacles_pos,
+            gate_sequence=jp.array(gate_sequence, dtype=int, device=device),
+            gate_sequence_direction=jp.array(gate_sequence_direction, dtype=int, device=device),
             sim_data=sim_data,
             sensor_range=jp.array([sensor_range], dtype=jp.float32, device=device),
         )
@@ -206,30 +223,34 @@ class EnvSettings:
         )
 
 
-def build_action_space(control_mode: Literal["state", "attitude"], drone_model: str) -> spaces.Box:
+def build_action_space(
+    control_mode: Literal["state", "attitude"], drone: Drone, dynamics: Dynamics
+) -> spaces.Box:
     """Create the action space for the environment.
 
     Args:
         control_mode: The control mode to use. Either "state" for full-state control
             or "attitude" for attitude control.
-        drone_model: Drone model of the environment.
+        drone: Drone model of the environment.
+        dynamics: Dynamics model used by the simulation.
 
     Returns:
         A Box space representing the action space for the specified control mode.
     """
     if control_mode == "state":
-        return spaces.Box(low=-np.inf, high=np.inf, shape=(13,))
+        return spaces.Box(low=-np.inf, high=np.inf, shape=(16,))
     if control_mode == "attitude":
-        params = ForceTorqueParams.load(drone_model)
-        thrust_min, thrust_max = params.thrust_min * 4, params.thrust_max * 4
+        params = load_dynamics_params(dynamics, drone)
+        total_thrust_min = params["thrust_min"] * 4
+        total_thrust_max = params["thrust_max"] * 4
         return spaces.Box(
-            np.array([-np.pi / 2, -np.pi / 2, -np.pi / 2, thrust_min], dtype=np.float32),
-            np.array([np.pi / 2, np.pi / 2, np.pi / 2, thrust_max], dtype=np.float32),
+            np.array([-np.pi / 2, -np.pi / 2, -np.pi / 2, total_thrust_min], dtype=np.float32),
+            np.array([np.pi / 2, np.pi / 2, np.pi / 2, total_thrust_max], dtype=np.float32),
         )
     raise ValueError(f"Invalid control mode: {control_mode}")
 
 
-def build_observation_space(n_gates: int, n_obstacles: int) -> spaces.Dict:
+def build_observation_space(n_gates: int, n_obstacles: int, n_gate_passes: int) -> spaces.Dict:
     """Create the observation space for the environment.
 
     The observation space is a dictionary containing the drone state, gate information,
@@ -238,13 +259,18 @@ def build_observation_space(n_gates: int, n_obstacles: int) -> spaces.Dict:
     Args:
         n_gates: Number of gates in the environment.
         n_obstacles: Number of obstacles in the environment.
+        n_gate_passes: Number of entries in the configured gate order.
     """
     obs_spec = {
         "pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,)),
         "quat": spaces.Box(low=-1, high=1, shape=(4,)),
         "vel": spaces.Box(low=-np.inf, high=np.inf, shape=(3,)),
         "ang_vel": spaces.Box(low=-np.inf, high=np.inf, shape=(3,)),
-        "target_gate": spaces.Discrete(n_gates, start=-1),
+        "n_gates_passed": spaces.Discrete(n_gate_passes + 1, start=0),
+        "gate_sequence": spaces.MultiDiscrete(np.full(n_gate_passes, n_gates, dtype=np.int64)),
+        "gate_sequence_direction": spaces.Box(
+            low=-1, high=1, shape=(n_gate_passes,), dtype=np.int32
+        ),
         "gates_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(n_gates, 3)),
         "gates_quat": spaces.Box(low=-1, high=1, shape=(n_gates, 4)),
         "gates_visited": spaces.Box(low=0, high=1, shape=(n_gates,), dtype=bool),
@@ -262,13 +288,13 @@ class RaceCoreEnv:
 
     This environment simulates a drone racing scenario where a single drone navigates through a
     series of gates in a predefined track. It supports various configuration options for
-    randomization, disturbances, and physics models.
+    randomization, disturbances, and dynamics models.
 
     The environment provides:
 
     * A customizable track with gates and obstacles
     * Configurable simulation and control frequencies
-    * Support for different physics models (e.g., identified dynamics, analytical dynamics)
+    * Support for different dynamics models (e.g., identified or from first principles)
     * Randomization of drone properties and initial conditions
     * Disturbance modeling for realistic flight conditions
     * Symbolic expressions for advanced control techniques (optional)
@@ -282,6 +308,11 @@ class RaceCoreEnv:
     * quat: Drone orientation as a quaternion (x, y, z, w)
     * vel: Drone linear velocity
     * ang_vel: Drone angular velocity
+    * n_gates_passed: The number of entries in the configured gate order that have already been
+      passed
+    * gate_sequence: The configured gate order expressed as 0-based gate IDs
+    * gate_sequence_direction: Signed passing direction for each gate-sequence entry. `1`
+      indicates the positive passing direction, `-1` the reverse direction
     * gates_pos: Positions of the gates
     * gates_quat: Orientations of the gates
     * gates_visited: Flags indicating if the drone already was/ is in the sensor range of the
@@ -289,10 +320,9 @@ class RaceCoreEnv:
     * obstacles_pos: Positions of the obstacles
     * obstacles_visited: Flags indicating if the drone already was/ is in the sensor range of the
       obstacles and the true position is known
-    * target_gate: The current target gate index
 
     The action space consists of a desired full-state command
-    [x, y, z, vx, vy, vz, ax, ay, az, yaw, rrate, prate, yrate] that is tracked by the drone's
+    [x, y, z, vx, vy, vz, ax, ay, az, qx, qy, qz, qw, wx, wy, wz] that is tracked by the drone's
     low-level controller, or a desired collective thrust and attitude command [collective thrust,
     roll, pitch, yaw].
     """
@@ -351,8 +381,8 @@ class RaceCoreEnv:
         self.sim = Sim(
             n_worlds=n_envs,
             n_drones=n_drones,
-            physics=sim_config.physics,
-            drone_model=sim_config.drone_model,
+            dynamics=sim_config.dynamics,
+            drone=sim_config.drone,
             control=control_mode,
             freq=sim_config.freq,
             state_freq=freq,
@@ -368,6 +398,7 @@ class RaceCoreEnv:
         self.track = track
         gates, obstacles, drones = load_track(track)
         n_gates, n_obstacles = len(track.gates), len(track.obstacles)
+        gate_sequence, gate_sequence_direction = load_gate_order(track, n_gates)
         contact_masks = _load_contact_masks(self.sim)
         specs = {} if disturbances is None else disturbances
         disturbances = {mode: rng_spec2fn(spec) for mode, spec in specs.items()}
@@ -396,6 +427,8 @@ class RaceCoreEnv:
             nominal_gates_pos=gates.nominal_pos,
             nominal_gates_quat=gates.nominal_quat,
             nominal_obstacles_pos=obstacles.nominal_pos,
+            gate_sequence=gate_sequence,
+            gate_sequence_direction=gate_sequence_direction,
             sim_data=self.sim.data,
             device=self.settings.device,
         )
@@ -439,8 +472,8 @@ class RaceCoreEnv:
 
         Args:
             data: The environment data.
-            action: Full-state command [x, y, z, vx, vy, vz, ax, ay, az, yaw, rrate, prate, yrate]
-                to follow.
+            action: Full-state command
+                [x, y, z, vx, vy, vz, ax, ay, az, qx, qy, qz, qw, wx, wy, wz] to follow.
         """
 
     def render(self):
@@ -475,6 +508,7 @@ class RaceCoreEnv:
         """Build a function that resets the environment data and simulation data."""
         sim_reset_fn = self.sim.build_reset_fn()
         default_sim_data = self.sim.default_data
+        device = self.settings.device
         randomize_track = build_track_randomization_fn(
             self.settings.randomizations, track=self.track
         )
@@ -485,7 +519,7 @@ class RaceCoreEnv:
         ) -> tuple[EnvData, tuple[dict[str, Array], dict]]:
             sim_data = data.sim_data
             if seed is not None:
-                sim_data = seed_sim(sim_data, seed, sim_data.core.device)
+                sim_data = seed_sim(sim_data, seed, device)
             key, subkey = jax.random.split(sim_data.core.rng_key, 2)
             sim_data = sim_data.replace(core=sim_data.core.replace(rng_key=key))
             # Randomization of the drone is compiled into the sim reset pipeline, so we don't need
@@ -543,7 +577,7 @@ class RaceCoreEnv:
 
     def build_apply_action_fn(self) -> Callable[[Array, EnvData, EnvSettings], EnvData]:
         """Build a function that applies the action to the simulation."""
-        action_space = build_action_space(self.sim.control, self.sim.drone_model)
+        action_space = build_action_space(self.sim.control, self.sim.drone, self.sim.dynamics)
         if self.sim.control == "state":
             ctrl_fn = F.state_control
         elif self.sim.control == "attitude":
@@ -633,13 +667,11 @@ class RaceCoreEnv:
         self.sim.data = self.sim.data.replace(states=states)
         self.sim.build_default_data()
         # Build the reset randomizations and disturbances into the sim itself
-        self.sim.reset_pipeline = self.sim.reset_pipeline + (build_drone_reset_fn(randomizations),)
+        append_fn(self.sim.reset_pipeline, build_reset_fn(randomizations))
         self.sim.build_reset_fn()
         if dist := self.settings.disturbances.get("dynamics"):
             disturbance_fn = build_dynamics_disturbance_fn(dist)
-            self.sim.step_pipeline = (
-                self.sim.step_pipeline[:2] + (disturbance_fn,) + self.sim.step_pipeline[2:]
-            )
+            insert_fn_before(self.sim.step_pipeline, "integration", disturbance_fn)
             self.sim.build_step_fn()
 
     def _load_track_into_sim(self, track: ConfigDict):
@@ -672,21 +704,24 @@ class RaceCoreEnv:
 
 def obs(data: EnvData) -> dict[str, Array]:
     """Return the observation of the environment."""
+    gate_sequence_shape = (*data.n_gates_passed.shape, data.gate_sequence.shape[0])
+    gate_sequence = jp.broadcast_to(data.gate_sequence, gate_sequence_shape)
+    gate_sequence_direction = jp.broadcast_to(data.gate_sequence_direction, gate_sequence_shape)
     mask = data.gates_visited[..., None]
-    sensor_gates_pos = jp.where(mask, data.gates_pos[:, None], data.nominal_gates_pos[None, None])
-    sensor_gates_quat = jp.where(
-        mask, data.gates_quat[:, None], data.nominal_gates_quat[None, None]
-    )
+    sensor_gates_pos = jp.where(mask, data.gates_pos[:, None], data.nominal_gates_pos[:, None])
+    sensor_gates_quat = jp.where(mask, data.gates_quat[:, None], data.nominal_gates_quat[:, None])
     mask = data.obstacles_visited[..., None]
     sensor_obstacles_pos = jp.where(
-        mask, data.obstacles_pos[:, None], data.nominal_obstacles_pos[None, None]
+        mask, data.obstacles_pos[:, None], data.nominal_obstacles_pos[:, None]
     )
     return {
         "pos": data.sim_data.states.pos,
         "quat": data.sim_data.states.quat,
         "vel": data.sim_data.states.vel,
         "ang_vel": data.sim_data.states.ang_vel,
-        "target_gate": data.target_gate,
+        "n_gates_passed": data.n_gates_passed,
+        "gate_sequence": gate_sequence,
+        "gate_sequence_direction": gate_sequence_direction,
         "gates_pos": sensor_gates_pos,
         "gates_quat": sensor_gates_quat,
         "gates_visited": data.gates_visited,
@@ -706,7 +741,7 @@ def reward(data: EnvData) -> Array:
     Returns:
         Reward for the current state.
     """
-    return -1.0 * (data.target_gate == -1)  # Implicit float conversion
+    return -1.0 * (data.n_gates_passed >= data.gate_sequence.shape[0])  # Implicit float conversion
 
 
 def terminated(data: EnvData) -> Array:
@@ -725,7 +760,7 @@ def _reset_env_data(data: EnvData, mask: Array | None = None) -> EnvData:
     """Reset auxiliary variables of the environment data."""
     drone_pos = data.sim_data.states.pos
     mask = jp.ones(data.steps.shape, dtype=bool) if mask is None else mask
-    target_gate = jp.where(mask[..., None], 0, data.target_gate)
+    n_gates_passed = jp.where(mask[..., None], 0, data.n_gates_passed)
     last_drone_pos = jp.where(mask[..., None, None], drone_pos, data.last_drone_pos)
     disabled_drones = jp.where(mask[..., None], False, data.disabled_drones)
     steps = jp.where(mask, 0, data.steps)
@@ -739,7 +774,7 @@ def _reset_env_data(data: EnvData, mask: Array | None = None) -> EnvData:
     obstacles_visited = jp.linalg.norm(dpos, axis=-1) < data.sensor_range
     obstacles_visited = jp.where(mask[..., None, None], obstacles_visited, data.obstacles_visited)
     return data.replace(
-        target_gate=target_gate,
+        n_gates_passed=n_gates_passed,
         last_drone_pos=last_drone_pos,
         disabled_drones=disabled_drones,
         gates_visited=gates_visited,
@@ -766,17 +801,17 @@ def _update_visited_objects(data: EnvData) -> EnvData:
 
 
 def _update_target_gates(data: EnvData) -> EnvData:
-    """Update the target gate index based on the current target gate and the number of gates."""
-    n_gates = data.gates_pos.shape[1]
+    """Update the number of passed gates based on the current target gate and the gate sequence."""
     gates_pos, gates_quat = data.gates_pos, data.gates_quat
     drone_pos = data.sim_data.states.pos
-    gate_pos = gates_pos[jp.arange(gates_pos.shape[0])[:, None], data.target_gate % n_gates]
-    gate_quat = gates_quat[jp.arange(gates_quat.shape[0])[:, None], data.target_gate % n_gates]
-    passed = gate_passed(drone_pos, data.last_drone_pos, gate_pos, gate_quat, (0.45, 0.45))
-    # Update the target gate index. Increment by one if drones have passed a gate
-    target_gate = data.target_gate + passed * ~data.disabled_drones
-    target_gate = jp.where(target_gate >= n_gates, -1, target_gate)
-    return data.replace(target_gate=target_gate, last_drone_pos=data.sim_data.states.pos)
+    gate_ids = data.gate_sequence[data.n_gates_passed]
+    reverse = data.gate_sequence_direction[data.n_gates_passed] < 0
+    gate_pos = gates_pos[jp.arange(gates_pos.shape[0])[:, None], gate_ids]
+    gate_quat = gates_quat[jp.arange(gates_quat.shape[0])[:, None], gate_ids]
+    passed = gate_passed(drone_pos, data.last_drone_pos, gate_pos, gate_quat, reverse, (0.45, 0.45))
+    # Advance the gate-order progress by one if drones have passed the current waypoint.
+    n_gates_passed = data.n_gates_passed + (passed & ~data.disabled_drones)
+    return data.replace(n_gates_passed=n_gates_passed, last_drone_pos=data.sim_data.states.pos)
 
 
 def _mark_drones_for_reset(data: EnvData) -> EnvData:
@@ -825,7 +860,7 @@ def _disabled_drones(pos: Array, contacts: Array, data: EnvData) -> Array:
     not_in_platform |= jp.any(pos[..., :2] > data.takeoff_pos[..., :2] + 0.02, axis=-1)
     disabled = disabled | jp.any(pos < data.pos_limit_low, axis=-1) & not_in_platform
     disabled = disabled | jp.any(pos > data.pos_limit_high, axis=-1)
-    disabled = disabled | (data.target_gate == -1)
+    disabled = disabled | (data.n_gates_passed >= data.gate_sequence.shape[0])
     contacts = jp.any(contacts[:, :, None] & data.contact_masks, axis=-1)
     disabled = disabled | contacts
     return disabled
@@ -849,7 +884,7 @@ def rng_spec2fn(fn_spec: dict) -> Callable:
     return random_fn
 
 
-def build_drone_reset_fn(randomizations: dict) -> Callable[[SimData, Array], SimData]:
+def build_reset_fn(randomizations: dict) -> Callable[[SimData, Array], SimData]:
     """Build the reset hook for the simulation."""
     randomization_fns = ()
     for target, rng in sorted(randomizations.items()):
@@ -867,7 +902,7 @@ def build_drone_reset_fn(randomizations: dict) -> Callable[[SimData, Array], Sim
             case _:
                 raise ValueError(f"Invalid target: {target}")
 
-    def reset_fn(data: SimData, mask: Array) -> SimData:
+    def reset_fn(data: SimData, _: SimData, mask: Array) -> SimData:
         for randomize_fn in randomization_fns:
             data = randomize_fn(data, mask)
         return data

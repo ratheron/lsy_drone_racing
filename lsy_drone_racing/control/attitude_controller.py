@@ -14,7 +14,7 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
-from drone_models.core import load_params
+from crazyflow.dynamics import load_params as load_dynamics_params
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
@@ -39,8 +39,8 @@ class AttitudeController(Controller):
         super().__init__(obs, info, config)
         self._freq = config.env.freq
 
-        # For more info on the models, check out https://github.com/learnsyslab/drone-models
-        drone_params = load_params(config.sim.physics, config.sim.drone_model)
+        # For more info on the models, check out https://github.com/learnsyslab/crazyflow
+        drone_params = load_dynamics_params(config.sim.dynamics, config.sim.drone)
         self.drone_mass = drone_params["mass"]
 
         self.kp = np.array([0.4, 0.4, 1.25])
@@ -50,11 +50,12 @@ class AttitudeController(Controller):
         self.i_error = np.zeros(3)
         self.g = 9.81
 
-        # Same waypoints as in the position controller. Determined by trial and error.
+        # Same waypoints as in the state controller. Determined by trial and error.
+        start_pos = obs["pos"]
         waypoints = np.array(
             [
-                [-1.5, 0.75, 0.05],
-                [-1.0, 0.55, 0.4],
+                start_pos,
+                [-1.0, 0.75, 0.4],
                 [0.3, 0.35, 0.7],
                 [1.3, -0.15, 0.9],
                 [0.9, 0.7, 1.2],
@@ -62,10 +63,12 @@ class AttitudeController(Controller):
                 [-1.2, -0.1, 0.8],
                 [-1.2, -0.1, 1.2],
                 [-0.0, -0.7, 1.2],
-                [0.5, -0.75, 1.2],
+                [1.2, -0.15, 1.2],
+                [1.05, 0.75, 1.2],
+                [0.25, 1.25, 1.2],
             ]
         )
-        self._t_total = 15  # s
+        self._t_total = 22.5  # s
         t = np.linspace(0, self._t_total, len(waypoints))
         self._des_pos_spline = CubicSpline(t, waypoints)
         self._des_vel_spline = self._des_pos_spline.derivative()
